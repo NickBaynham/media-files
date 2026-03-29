@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Iterator, List, NamedTuple, Optional, Tuple
+from typing import Iterator, List, NamedTuple, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 
 class LocalFileEntry(NamedTuple):
@@ -147,3 +150,47 @@ def chunked(iterable: List[str], size: int) -> Iterator[List[str]]:
     """Yield slices of *iterable* of length at most *size*."""
     for i in range(0, len(iterable), size):
         yield iterable[i : i + size]
+
+
+def s3_public_object_url(bucket: str, region: str, key: str) -> str:
+    """HTTPS URL for anonymous access checks (virtual-hosted—style)."""
+    if region == "us-east-1":
+        host = f"{bucket}.s3.amazonaws.com"
+    else:
+        host = f"{bucket}.s3.{region}.amazonaws.com"
+    path = quote(key, safe="/~")
+    return f"https://{host}/{path}"
+
+
+def anonymous_http_head_status(url: str) -> Tuple[Optional[int], str]:
+    """Return ``(HTTP status or None, empty or error hint)`` for an unauthenticated HEAD."""
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.getcode(), ""
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except urllib.error.URLError as e:
+        return None, str(e.reason if hasattr(e, "reason") else e)
+
+
+def probe_public_read_for_keys(
+    bucket: str,
+    region: str,
+    keys: Sequence[str],
+) -> Tuple[int, List[Tuple[str, Optional[int]]]]:
+    """
+    Send an anonymous HEAD for each S3 object URL.
+
+    Returns ``(count_with_http_200, list of (key, status) for non-200)``.
+    """
+    ok = 0
+    failures: List[Tuple[str, Optional[int]]] = []
+    for key in keys:
+        url = s3_public_object_url(bucket, region, key)
+        code, _err = anonymous_http_head_status(url)
+        if code == 200:
+            ok += 1
+        else:
+            failures.append((key, code))
+    return ok, failures

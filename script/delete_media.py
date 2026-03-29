@@ -102,6 +102,78 @@ def run_delete_objects(
     return 0 if failed == 0 else 1
 
 
+def run_remove_bucket(
+    config: Config,
+    *,
+    force: bool = False,
+    cli_dry_run: Optional[bool] = None,
+) -> int:
+    """
+    Delete every object in ``S3_BUCKET_NAME``, then delete the bucket.
+
+    Ignores ``S3_KEY_PREFIX`` and any CLI ``--prefix`` — use this for a full reset
+    (for example before recreating the bucket with different public-access settings).
+    """
+    config = merge_dry_run(config, cli_dry_run)
+    setup_logging(config.log_level)
+
+    client = s3_client(config)
+    name = config.s3_bucket_name
+    if not bucket_exists(client, name):
+        logging.error("Bucket does not exist: %s", name)
+        return 1
+
+    all_objs = list_all_keys_with_prefix(client, name, "")
+    n_obj = len(all_objs)
+    total_sz = sum(int(o.get("Size", 0)) for o in all_objs)
+
+    print()
+    print("REMOVE BUCKET (full reset)")
+    print("===========================")
+    print(f"  Bucket:   s3://{name}")
+    print(f"  Objects:  {n_obj}")
+    print(f"  Bytes:    {total_sz}")
+    print()
+    print("  This removes EVERY object (all prefixes), then deletes the bucket.")
+    print("  It does not use S3_KEY_PREFIX.")
+    if config.dry_run:
+        print("  (dry-run: no changes will be made)")
+
+    if not force and not config.dry_run:
+        if n_obj:
+            prompt = f"Delete all {n_obj} object(s) and bucket {name!r}?"
+        else:
+            prompt = f"Delete empty bucket {name!r}?"
+        if not confirm_yes_no(prompt, default_no=True):
+            print("Aborted.")
+            return 0
+
+    try:
+        if n_obj > 0:
+            logging.info("Deleting all objects in bucket %s ...", name)
+            delete_all_under_prefix(client, name, "", dry_run=config.dry_run)
+            if not config.dry_run:
+                remaining = list_all_keys_with_prefix(client, name, "")
+                if remaining:
+                    logging.error(
+                        "%s object(s) still remain; bucket not deleted.",
+                        len(remaining),
+                    )
+                    return 1
+        delete_bucket_empty(client, name, dry_run=config.dry_run)
+    except ClientError as e:
+        logging.error("%s", e)
+        return 1
+
+    if config.dry_run:
+        logging.info("[dry-run] remove-bucket simulation complete")
+    else:
+        logging.info("Bucket removed: %s", name)
+        print()
+        print(f"Done. Bucket {name!r} no longer exists. Run `make upload` to create it again.")
+    return 0
+
+
 def run_delete_bucket(
     config: Config,
     *,

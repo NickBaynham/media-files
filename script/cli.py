@@ -5,7 +5,9 @@ Command-line entry point for S3 media management.
 Run from the repository root, for example::
 
     python script/cli.py list-local
+    python script/cli.py list-uploaded
     python script/cli.py upload --dry-run
+    python script/cli.py upload --public
 """
 
 from __future__ import annotations
@@ -28,8 +30,9 @@ from delete_media import (
     run_cleanup,
     run_delete_bucket,
     run_delete_objects,
+    run_remove_bucket,
 )
-from list_media import run_list_local
+from list_media import run_check_public, run_list_local, run_list_uploaded
 from s3_utils import S3OperationError
 from upload_media import run_upload
 from utils import setup_logging
@@ -88,11 +91,64 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_list.set_defaults(handler=_cmd_list_local)
 
+    p_list_s3 = sub.add_parser(
+        "list-uploaded",
+        help="List objects in the S3 bucket (under S3_KEY_PREFIX unless --all-bucket).",
+    )
+    _add_common_s3_args(p_list_s3)
+    p_list_s3.add_argument(
+        "--all-bucket",
+        action="store_true",
+        help=(
+            "List every object in the bucket. By default, only keys under the "
+            "configured (or --prefix) key prefix are shown."
+        ),
+    )
+    p_list_s3.set_defaults(handler=_cmd_list_uploaded)
+
+    p_chk = sub.add_parser(
+        "check-public",
+        help=(
+            "Send an unauthenticated HTTP HEAD to each object URL to see if "
+            "anonymous reads work (bucket policy / ACL effective check)."
+        ),
+    )
+    _add_common_s3_args(p_chk)
+    p_chk.add_argument(
+        "--all-bucket",
+        action="store_true",
+        help="Check every object in the bucket (ignore configured key prefix).",
+    )
+    p_chk.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Maximum number of objects to probe (default: 200; use 0 for no limit).",
+    )
+    p_chk.set_defaults(handler=_cmd_check_public)
+
     p_up = sub.add_parser(
         "upload",
         help="Upload all files under files/ to S3 (create bucket if missing).",
     )
     _add_common_s3_args(p_up)
+    p_up.add_argument(
+        "--public",
+        action="store_true",
+        help=(
+            "Public website mode: auto bucket policy (GetObject) when the bucket is new "
+            "or has no policy, then upload with public-read ACL or ACL fallback—see README."
+        ),
+    )
+    p_up.add_argument(
+        "--no-bucket-policy",
+        action="store_true",
+        help=(
+            "With --public, do not attach or update the automatic anonymous s3:GetObject "
+            "bucket policy (you manage policy in the console)."
+        ),
+    )
     p_up.set_defaults(handler=_cmd_upload)
 
     p_del_o = sub.add_parser(
@@ -135,6 +191,31 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_del_b.set_defaults(handler=_cmd_delete_bucket)
+
+    p_remove = sub.add_parser(
+        "remove-bucket",
+        help=(
+            "Delete every object in the bucket, then delete the bucket (full reset). "
+            "Ignores S3_KEY_PREFIX."
+        ),
+    )
+    p_remove.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip confirmation (use only in scripts you trust).",
+    )
+    p_remove.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would happen without deleting.",
+    )
+    p_remove.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Shortcut for debug logging.",
+    )
+    p_remove.set_defaults(handler=_cmd_remove_bucket)
 
     p_clean = sub.add_parser(
         "cleanup",
@@ -204,12 +285,36 @@ def _cmd_list_local(args: argparse.Namespace) -> int:
     return run_list_local(args.project_root.resolve(), config=cfg)
 
 
+def _cmd_list_uploaded(args: argparse.Namespace) -> int:
+    cfg = _load_cfg(args, require_aws=True)
+    cfg = merge_dry_run(cfg, _cli_dry_run(args))
+    setup_logging(cfg.log_level)
+    return run_list_uploaded(
+        cfg,
+        prefix_override=args.prefix,
+        all_bucket=bool(getattr(args, "all_bucket", False)),
+    )
+
+
+def _cmd_check_public(args: argparse.Namespace) -> int:
+    cfg = _load_cfg(args, require_aws=True)
+    setup_logging(cfg.log_level)
+    return run_check_public(
+        cfg,
+        prefix_override=args.prefix,
+        all_bucket=bool(getattr(args, "all_bucket", False)),
+        limit=int(args.limit),
+    )
+
+
 def _cmd_upload(args: argparse.Namespace) -> int:
     cfg = _load_cfg(args, require_aws=True)
     return run_upload(
         cfg,
         prefix_override=args.prefix,
         cli_dry_run=_cli_dry_run(args),
+        public_read=bool(getattr(args, "public", False)),
+        skip_public_bucket_policy=bool(getattr(args, "no_bucket_policy", False)),
     )
 
 
@@ -231,6 +336,15 @@ def _cmd_delete_bucket(args: argparse.Namespace) -> int:
         force=args.force,
         empty_under_prefix_first=args.empty_under_prefix_first,
         full_bucket=args.full_bucket,
+        cli_dry_run=_cli_dry_run(args),
+    )
+
+
+def _cmd_remove_bucket(args: argparse.Namespace) -> int:
+    cfg = _load_cfg(args, require_aws=True)
+    return run_remove_bucket(
+        cfg,
+        force=args.force,
         cli_dry_run=_cli_dry_run(args),
     )
 

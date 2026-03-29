@@ -2,13 +2,25 @@
 PY := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 CLI := $(PY) script/cli.py
 
-.PHONY: upload list delete
+.PHONY: upload upload-public list-local list-uploaded check-public delete remove-bucket
 
 upload:
 	$(CLI) upload
 
-list:
+upload-public:
+	$(CLI) upload --public
+
+list-local:
 	$(CLI) list-local
+
+list-uploaded:
+	$(CLI) list-uploaded
+
+check-public:
+	$(CLI) check-public
 
 delete:
 	$(CLI) delete-objects
+
+remove-bucket:
+	$(CLI) remove-bucket

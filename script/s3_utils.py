@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+from boto3.exceptions import S3UploadFailedError
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
 
@@ -98,6 +100,118 @@ def create_bucket_if_missing(client: BaseClient, config: Config) -> bool:
         raise S3OperationError(f"Could not create bucket ({code}): {msg}") from e
 
 
+def bucket_policy_resource_arn(bucket: str, key_prefix: str) -> str:
+    """IAM ``Resource`` ARN for ``s3:GetObject`` (whole bucket or under a key prefix)."""
+    base = f"arn:aws:s3:::{bucket}"
+    p = (key_prefix or "").strip().strip("/")
+    if not p:
+        return f"{base}/*"
+    return f"{base}/{p}/*"
+
+
+def bucket_has_policy(client: BaseClient, bucket: str) -> Optional[bool]:
+    """
+    Return True if a bucket policy exists, False if none.
+
+    Returns None if the policy cannot be read (e.g. access denied).
+    """
+    try:
+        client.get_bucket_policy(Bucket=bucket)
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "NoSuchBucketPolicy":
+            return False
+        if code in ("403", "AccessDenied"):
+            return None
+        raise
+
+
+def ensure_public_get_object_bucket_policy(
+    client: BaseClient,
+    bucket: str,
+    key_prefix: str,
+    *,
+    dry_run: bool,
+) -> bool:
+    """
+    Allow anonymous ``s3:GetObject`` via a bucket policy on *resource_arn* scope.
+
+    Relaxes **Block Public Access** only far enough to allow a *policy-based* public
+    read (keeps blocking public **ACLs**). Safe to call when the bucket has no
+    policy yet or was just created.
+
+    Returns True if the policy was applied (or dry-run). False if ``PutBucketPolicy``
+    failed (logs the policy JSON for manual use).
+    """
+    resource = bucket_policy_resource_arn(bucket, key_prefix)
+    policy_doc = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "MediaFilesCLIPublicReadGetObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": resource,
+            }
+        ],
+    }
+    policy_str = json.dumps(policy_doc, indent=2)
+
+    if dry_run:
+        logging.info(
+            "[dry-run] would set public-access-block (policy OK, ACLs blocked) and "
+            "attach GetObject bucket policy on %s for %s",
+            bucket,
+            resource,
+        )
+        return True
+
+    try:
+        client.put_public_access_block(
+            Bucket=bucket,
+            PublicAccessBlockConfiguration={
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": False,
+                "RestrictPublicBuckets": False,
+            },
+        )
+        logging.info(
+            "Public access block updated on %s: public bucket policies allowed; "
+            "public ACLs still blocked.",
+            bucket,
+        )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        logging.warning(
+            "Could not update public access block on %s (%s). "
+            "If PutBucketPolicy fails, disable blocking of public policies in the S3 console.",
+            bucket,
+            code,
+        )
+
+    try:
+        client.put_bucket_policy(Bucket=bucket, Policy=json.dumps(policy_doc))
+        logging.info(
+            "Attached bucket policy allowing anonymous s3:GetObject on %s",
+            resource,
+        )
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        msg = e.response.get("Error", {}).get("Message", str(e))
+        logging.error(
+            "PutBucketPolicy failed (%s): %s\nYou can paste this policy manually "
+            "(S3 → Permissions → Bucket policy):\n%s",
+            code,
+            msg,
+            policy_str,
+        )
+        return False
+
+
 def head_object_meta(
     client: BaseClient, bucket: str, key: str
 ) -> Optional[Tuple[int, str]]:
@@ -124,6 +238,18 @@ def guess_content_type(path: Path) -> Optional[str]:
     return ctype
 
 
+def _client_error_from_upload_failure(exc: BaseException) -> Optional[ClientError]:
+    """Find a ``ClientError`` inside boto3 upload exception chains."""
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ClientError):
+            return cur
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
 def upload_file(
     client: BaseClient,
     config: Config,
@@ -131,16 +257,28 @@ def upload_file(
     key: str,
     *,
     dry_run: bool,
-) -> int:
+    fallback_without_acl: bool = False,
+) -> Tuple[int, bool]:
     """
-    Upload *local_path* to *key*. Returns bytes uploaded (0 if dry-run skip).
+    Upload *local_path* to *key*.
+
+    Returns ``(bytes_uploaded, acl_fallback)`` where *acl_fallback* is True if the
+    bucket rejected ACLs and the object was stored without an ACL (only when
+    *fallback_without_acl* is True).
 
     Uses SSE-S3 AES256, storage class, and optional ACL from config.
     """
     size = local_path.stat().st_size
     if dry_run:
-        logging.info("[dry-run] would upload %s -> s3://%s/%s", local_path, config.s3_bucket_name, key)
-        return 0
+        acl_note = f" ACL={config.s3_acl}" if config.s3_acl else ""
+        logging.info(
+            "[dry-run] would upload %s -> s3://%s/%s%s",
+            local_path,
+            config.s3_bucket_name,
+            key,
+            acl_note,
+        )
+        return 0, False
 
     extra: Dict[str, Any] = {
         "ServerSideEncryption": "AES256",
@@ -153,13 +291,53 @@ def upload_file(
     if ctype:
         extra["ContentType"] = ctype
 
-    client.upload_file(
-        str(local_path),
-        config.s3_bucket_name,
-        key,
-        ExtraArgs=extra,
-    )
-    return size
+    try:
+        client.upload_file(
+            str(local_path),
+            config.s3_bucket_name,
+            key,
+            ExtraArgs=extra,
+        )
+        return size, False
+    except S3UploadFailedError as e:
+        ce = _client_error_from_upload_failure(e)
+        code = ce.response.get("Error", {}).get("Code", "") if ce else ""
+        if (
+            code == "AccessControlListNotSupported"
+            and "ACL" in extra
+            and fallback_without_acl
+        ):
+            extra_no_acl = {k: v for k, v in extra.items() if k != "ACL"}
+            logging.warning(
+                "Bucket does not allow object ACLs; uploaded %r without canned ACL. "
+                "Objects are not public until you add a bucket policy (see README).",
+                key,
+            )
+            try:
+                client.upload_file(
+                    str(local_path),
+                    config.s3_bucket_name,
+                    key,
+                    ExtraArgs=extra_no_acl,
+                )
+            except S3UploadFailedError as e2:
+                ce2 = _client_error_from_upload_failure(e2)
+                c2 = ce2.response.get("Error", {}).get("Code", "") if ce2 else ""
+                raise S3OperationError(
+                    f"Upload failed after ACL fallback ({c2}): {e2}"
+                ) from e2
+            return size, True
+        if code == "AccessControlListNotSupported" and "ACL" in extra:
+            raise S3OperationError(
+                "This bucket does not allow ACLs (Object Ownership is often "
+                "'Bucket owner enforced'). Remove S3_ACL from .env or use "
+                "`upload --public` (which falls back and documents bucket policies), "
+                "or change bucket ownership settings—see README."
+            ) from e
+        if ce:
+            msg = ce.response.get("Error", {}).get("Message", str(e))
+            raise S3OperationError(f"Upload failed ({code}): {msg}") from e
+        raise S3OperationError(f"Upload failed: {e}") from e
 
 
 def delete_objects_keys(
@@ -182,14 +360,17 @@ def delete_objects_keys(
         return len(keys), []
 
     to_delete = [{"Key": k} for k in keys]
+    # Do not use Quiet=True: S3 omits successful keys from the response, so counts
+    # would show 0 even when every object was deleted.
     resp = client.delete_objects(
         Bucket=bucket,
-        Delete={"Objects": to_delete, "Quiet": True},
+        Delete={"Objects": to_delete, "Quiet": False},
     )
-    deleted = resp.get("Deleted") or []
     errs = resp.get("Errors") or []
-    n = len(deleted)
     failed = [e.get("Key", "?") for e in errs]
+    # Each key either errors or succeeds; Quiet=False populates Deleted, but this
+    # arithmetic stays correct if the API shape changes.
+    n = len(keys) - len(errs)
     for e in errs:
         logging.error(
             "Delete failed: %s — %s",
